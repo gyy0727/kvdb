@@ -4,9 +4,11 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"sync"
+	"github.com/gyy0727/kvdb/bytebufferpool"
 )
 
 // *块类型
@@ -28,43 +30,43 @@ var (
 )
 
 const (
-	chunkHeaderSize = 7
-	blockSize       = 32 * KB
-	fileModePerm    = 0644
-	maxLen          = binary.MaxVarintLen32*3 + binary.MaxVarintLen64
+	chunkHeaderSize = 7                                               //*块的头部大小
+	blockSize       = 32 * KB                                         //*块的大小
+	fileModePerm    = 0644                                            //*文件权限
+	maxLen          = binary.MaxVarintLen32*3 + binary.MaxVarintLen64 //*最大大小,25字节
 )
 
 // *表示一个段文件，管理文件的写入操作，包括块的编号和大小
 type segment struct {
-	id                 SegmentID //*段ID
-	fd                 *os.File  //*对应的文件
-	currentBlockNumber uint32    //*当前正在写入的块id
-	currentBlockSize   uint32    //*当前的块已经写入到的位置
-	closed             bool      //*是否已经关闭
-	header             []byte
-	startupBlock       *startupBlock
-	isStartupTraversal bool
+	id                 SegmentID     //*段ID
+	fd                 *os.File      //*对应的文件
+	currentBlockNumber uint32        //*当前正在写入的块id
+	currentBlockSize   uint32        //*当前的块已经写入到的位置
+	closed             bool          //*是否已经关闭
+	header             []byte        //*头部数据
+	startupBlock       *startupBlock //*启动块，用于初始化时的遍历
+	isStartupTraversal bool          //*是否正在进行启动遍历
 }
 
 // *用于遍历段文件中的数据，提供逐块读取的功能
 type segmentReader struct {
-	segment     *segment
-	blockNumber uint32
-	chunkOffset int64
+	segment     *segment //*段文件
+	blockNumber uint32   //*块编号
+	chunkOffset int64    //*块偏移量
 }
 
 // *用于启动时遍历的块
 type startupBlock struct {
-	block       []byte
-	blockNumber int64
+	block       []byte //*块数据
+	blockNumber int64  //*块编号
 }
 
 // *表示数据块在段文件中的位置，用于精确读取数据
 type ChunkPosition struct {
-	SegmentId   SegmentID
-	BlockNumber uint32
-	ChunkOffset int64
-	ChunkSize   uint32
+	SegmentId   SegmentID //*所属的段id
+	BlockNumber uint32    //*块id
+	ChunkOffset int64     //*块偏移量
+	ChunkSize   uint32    //*块大小
 }
 
 // *对象池
@@ -84,6 +86,7 @@ func putBuffer(buf []byte) {
 	blockPool.Put(buf)
 }
 
+// *打开段文件
 func openSegementFile(dirPath, extName string, id uint32) (*segment, error) {
 	fd, err := os.OpenFile(SegmentFileName(dirPath, extName, id), os.O_CREATE|os.O_RDWR|os.O_APPEND, fileModePerm)
 	if err != nil {
@@ -110,6 +113,7 @@ func openSegementFile(dirPath, extName string, id uint32) (*segment, error) {
 
 }
 
+// *新建段头部
 func (seg *segment) NewReader() *segmentReader {
 	return &segmentReader{
 		segment:     seg,
@@ -150,4 +154,255 @@ func (seg *segment) Close() error {
 func (seg *segment) Size() int64 {
 	size := int64(seg.currentBlockNumber) * int64(blockSize)
 	return size + int64(seg.currentBlockSize)
+}
+
+// *将数据写入bufferpool
+func (seg *segment) writeToBuffer(data []byte, chunkBuffer *bytebufferpool.ByteBuffer) (*ChunkPosition, error) {
+	//*记录初始位置
+	startBufferLen := chunkBuffer.Len()
+	//*填充 
+	padding := uint32(0)
+	if seg.closed {
+		return nil, ErrClosed
+	}
+
+	//*如果当前块的大小不足以容纳
+	if seg.currentBlockSize+chunkHeaderSize >= blockSize {
+		if seg.currentBlockSize < blockSize {
+			p := make([]byte, blockSize-seg.currentBlockSize)
+			chunkBuffer.B = append(chunkBuffer.B, p...)
+			padding += blockSize - seg.currentBlockSize
+			seg.currentBlockNumber += 1
+			seg.currentBlockSize = 0
+		}
+	}
+
+	position := &ChunkPosition{
+		SegmentId:   seg.id,
+		BlockNumber: seg.currentBlockNumber,
+		ChunkOffset: int64(seg.currentBlockSize),
+	}
+
+	dataSize := uint32(len(data))
+
+	if seg.currentBlockSize+dataSize+chunkHeaderSize <= blockSize {
+		seg.appendChunkBuffer(chunkBuffer, data, ChunkTypeFull)
+		position.ChunkSize = dataSize + chunkHeaderSize
+	} else {
+		var (
+			leftSize             = dataSize
+			blockCount    uint32 = 0
+			currBlockSize        = seg.currentBlockSize
+		)
+
+		for leftSize > 0 {
+			chunkSize := blockSize - currBlockSize - chunkHeaderSize
+			if chunkSize > leftSize {
+				chunkSize = leftSize
+			}
+
+			var end = dataSize - leftSize + chunkSize
+			if end > dataSize {
+				end = dataSize
+			}
+
+		
+			var chunkType ChunkType
+			switch leftSize {
+			case dataSize: 
+				chunkType = ChunkTypeFirst
+			case chunkSize:
+				chunkType = ChunkTypeLast
+			default:
+				chunkType = ChunkTypeMiddle
+			}
+			seg.appendChunkBuffer(chunkBuffer, data[dataSize-leftSize:end], chunkType)
+
+			leftSize -= chunkSize
+			blockCount += 1
+			currBlockSize = (currBlockSize + chunkSize + chunkHeaderSize) % blockSize
+		}
+		position.ChunkSize = blockCount*chunkHeaderSize + dataSize
+	}
+
+
+	endBufferLen := chunkBuffer.Len()
+	if position.ChunkSize+padding != uint32(endBufferLen-startBufferLen) {
+		return nil, fmt.Errorf("wrong!!! the chunk size %d is not equal to the buffer len %d",
+			position.ChunkSize+padding, endBufferLen-startBufferLen)
+	}
+
+	
+	seg.currentBlockSize += position.ChunkSize
+	if seg.currentBlockSize >= blockSize {
+		seg.currentBlockNumber += seg.currentBlockSize / blockSize
+		seg.currentBlockSize = seg.currentBlockSize % blockSize
+	}
+
+	return position, nil
+}
+
+func (seg *segment) writeAll(data [][]byte) (positions []*ChunkPosition, err error) {
+	if seg.closed {
+		return nil, ErrClosed
+	}
+	//*if something wrong ,restore the segement status
+	originBlockNumber := seg.currentBlockNumber
+	originBlockSize := seg.currentBlockSize
+	//*取出一个[]byte的对象
+	chunkBuffer := bytebufferpool.Get()
+	//*清空里面的数据
+	chunkBuffer.Reset()
+	//*如果出错,用于重置segement的状态
+	defer func() {
+		if err != nil {
+			seg.currentBlockNumber = originBlockNumber
+			seg.currentBlockSize = originBlockSize
+
+		}
+		bytebufferpool.Put(chunkBuffer)
+	}()
+
+	var pos *ChunkPosition
+	positions = make([]*ChunkPosition, len(data))
+	positions = make([]*ChunkPosition, 0, len(data))
+	for i := 0; i < len(positions); i++ {
+		pos, err = seg.writeToBuffer(data[i], chunkBuffer)
+		if err != nil {
+			return
+		}
+		positions[i] = pos
+	}
+	if err = seg.writeChunkBuffer(chunkBuffer); err != nil {
+		return
+	}
+	return
+
+}
+
+func (seg *segment) write(data []byte) (pos *ChunkPosition, err error) {
+	if seg.closed {
+		return nil, ErrClosed
+	}
+
+	//*用于在出现错误时回滚
+	originBlockNumber := seg.currentBlockNumber
+	originBlockSize := seg.currentBlockSize
+
+	chunkBuffer := bytebufferpool.Get()
+	chunkBuffer.Reset() //*清空
+
+	//*回滚操作
+	defer func() {
+		if err != nil {
+			seg.currentBlockNumber = originBlockNumber
+			seg.currentBlockSize = originBlockSize
+		}
+		bytebufferpool.Put(chunkBuffer)
+	}()
+
+	pos, err = seg.writeToBuffer(data, chunkBuffer)
+	if err != nil {
+		return
+	}
+
+	if err = seg.writeChunkBuffer(chunkBuffer); err != nil {
+		return
+	}
+	return
+}
+
+// *主要作用是将data和chunkType以及校验和写入到buf中
+func (seg *segment) appendChunkBuffer(buf *bytebufferpool.ByteBuffer, data []byte, chunkType ChunkType) {
+	//*将一个16为无符号的整数写入切片的指定位置,小端序
+	binary.LittleEndian.PutUint16(seg.header[4:6], uint16(len(data)))
+	seg.header[6] = chunkType
+	sum := crc32.ChecksumIEEE((seg.header[4:]))
+	sum = crc32.Update(sum, crc32.IEEETable, data)
+	//*将校验和放到前三个位置
+	binary.LittleEndian.PutUint32(seg.header[0:4], sum)
+	buf.B = append(buf.B, seg.header...)
+	buf.B = append(buf.B, data...)
+}
+
+// *将准备好的chunk buffer写入段文件
+func (seg *segment) writeChunkBuffer(buf *bytebufferpool.ByteBuffer) error {
+	if seg.currentBlockSize > blockSize {
+		return errors.New("the current block size is bigger than block size")
+	}
+	if _, err := seg.fd.Write(buf.Bytes()); err != nil {
+		return err
+	}
+	seg.startupBlock.blockNumber = -1
+	return nil
+}
+
+//*返回下一个块
+// func (segReader *segmentReader)Next()([]byte,*ChunkPosition,error){
+// 	if segReader.segment.closed{
+// 		return nil,nil,ErrClosed
+// 	}
+// 	//*描述当前的快
+// 	chunkPosition :=&ChunkPosition{
+// 		SegmentId:   segReader.segment.id,
+// 		BlockNumber: segReader.blockNumber,
+// 		ChunkOffset: segReader.chunkOffset,
+// 	}
+
+// }
+
+// *仅返回实际使用部分
+func (cp *ChunkPosition) Encode() []byte {
+	return cp.encode(true)
+}
+
+// *返回完整的编码字节数组
+func (cp *ChunkPosition) EncodeFixedSize() []byte {
+	return cp.encode(false)
+}
+
+// *将chunkposition编码成字节数组
+// *shrink 返回整个字节数组or实际使用的部分
+func (cp *ChunkPosition) encode(shrink bool) []byte {
+	buf := make([]byte, maxLen)
+
+	var index = 0
+
+	index += binary.PutUvarint(buf[index:], uint64(cp.SegmentId))
+
+	index += binary.PutUvarint(buf[index:], uint64(cp.BlockNumber))
+
+	index += binary.PutUvarint(buf[index:], uint64(cp.ChunkOffset))
+
+	index += binary.PutUvarint(buf[index:], uint64(cp.ChunkSize))
+
+	if shrink {
+		return buf[:index]
+	}
+	return buf
+}
+
+// *从字节数组中解码出position
+func DecodeChunkPosition(buf []byte) *ChunkPosition {
+	if len(buf) == 0 {
+		return nil
+	}
+	var index = 0
+	segmentId, n := binary.Uvarint(buf[index:])
+	index += n
+
+	blockNumber, n := binary.Uvarint(buf[index:])
+	index += n
+
+	chunkOffset, n := binary.Uvarint(buf[index:])
+	index += n
+	chunkSize, n := binary.Uvarint(buf[index:])
+	index += n
+
+	return &ChunkPosition{
+		SegmentId:   uint32(segmentId),
+		BlockNumber: uint32(blockNumber),
+		ChunkOffset: int64(chunkOffset),
+		ChunkSize:   uint32(chunkSize),
+	}
 }

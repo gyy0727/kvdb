@@ -21,6 +21,6 @@ var DefaultOptions = Options{
 	DirPath:        os.TempDir(), //*TempDir返回一个用于保管临时文件的默认目录。
 	SegmentSize:    GB,           //*1G
 	SegmentFileExt: ".SEG",       //*后缀
-	Sync:           false,
-	BytesPerSync:   0,
+	Sync:           false,        //*是否已经刷新数据到磁盘
+	BytesPerSync:   0,            //*每多少字节刷新一次
 }

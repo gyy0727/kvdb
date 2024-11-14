@@ -2,6 +2,7 @@ package bytebufferpool
 
 import "io"
 
+//*byte数组
 type ByteBuffer struct {
 	B []byte
 }
@@ -11,7 +12,7 @@ func (b *ByteBuffer) Len() int {
 	return len(b.B)
 }
 
-// *从io流中读取数据
+// *从IO流中读取数据放入bytebuffer
 func (b *ByteBuffer) ReadFrom(r io.Reader) (int64, error) {
 	p := b.B
 	nStart := int64(len(p)) //*起始位置
@@ -46,6 +47,7 @@ func (b *ByteBuffer) ReadFrom(r io.Reader) (int64, error) {
 	}
 }
 
+//*将buffer的数据写入到io流
 func (b *ByteBuffer) WriteTo(w io.Writer) (int64, error) {
 	n, err := w.Write(b.B)
 	return int64(n), err
