@@ -1,6 +1,6 @@
-module github.com/gyy0727/kvdb
+module test
 
-go 1.22.3
+go 1.23.2
 
 require github.com/rosedblabs/rosedb/v2 v2.3.9
 

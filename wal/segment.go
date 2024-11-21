@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"sync"
+
 	"github.com/gyy0727/kvdb/bytebufferpool"
 )
 
@@ -17,6 +18,7 @@ type ChunkType = byte
 // *段ID
 type SegmentID = uint32
 
+// *块的类型
 const (
 	ChunkTypeFull ChunkType = iota
 	ChunkTypeFirst
@@ -30,10 +32,10 @@ var (
 )
 
 const (
-	chunkHeaderSize = 7                                               //*块的头部大小
+	chunkHeaderSize = 7                                               //*块的头部大小,每一个记录中装有信息的头部
 	blockSize       = 32 * KB                                         //*块的大小
 	fileModePerm    = 0644                                            //*文件权限
-	maxLen          = binary.MaxVarintLen32*3 + binary.MaxVarintLen64 //*最大大小,25字节
+	maxLen          = binary.MaxVarintLen32*3 + binary.MaxVarintLen64 //*最大大小,25
 )
 
 // *表示一个段文件，管理文件的写入操作，包括块的编号和大小
@@ -69,7 +71,7 @@ type ChunkPosition struct {
 	ChunkSize   uint32    //*块大小
 }
 
-// *对象池
+// *对象池,返回一个block,即单条记录
 var blockPool = sync.Pool{
 	New: func() interface{} {
 		return make([]byte, blockSize)
@@ -113,7 +115,7 @@ func openSegementFile(dirPath, extName string, id uint32) (*segment, error) {
 
 }
 
-// *新建段头部
+// *新建段文件头部
 func (seg *segment) NewReader() *segmentReader {
 	return &segmentReader{
 		segment:     seg,
@@ -160,13 +162,13 @@ func (seg *segment) Size() int64 {
 func (seg *segment) writeToBuffer(data []byte, chunkBuffer *bytebufferpool.ByteBuffer) (*ChunkPosition, error) {
 	//*记录初始位置
 	startBufferLen := chunkBuffer.Len()
-	//*填充 
+	//*填充数据的大小
 	padding := uint32(0)
 	if seg.closed {
 		return nil, ErrClosed
 	}
 
-	//*如果当前块的大小不足以容纳
+	//*如果当前块的大小不足以容纳,填充字节,然后写入到下一个块
 	if seg.currentBlockSize+chunkHeaderSize >= blockSize {
 		if seg.currentBlockSize < blockSize {
 			p := make([]byte, blockSize-seg.currentBlockSize)
@@ -177,47 +179,52 @@ func (seg *segment) writeToBuffer(data []byte, chunkBuffer *bytebufferpool.ByteB
 		}
 	}
 
+	//*更改定位
 	position := &ChunkPosition{
 		SegmentId:   seg.id,
 		BlockNumber: seg.currentBlockNumber,
 		ChunkOffset: int64(seg.currentBlockSize),
 	}
 
+	//*要写入的数据大小
 	dataSize := uint32(len(data))
 
+	//*足够容纳,写入当前块
 	if seg.currentBlockSize+dataSize+chunkHeaderSize <= blockSize {
 		seg.appendChunkBuffer(chunkBuffer, data, ChunkTypeFull)
 		position.ChunkSize = dataSize + chunkHeaderSize
 	} else {
 		var (
-			leftSize             = dataSize
-			blockCount    uint32 = 0
-			currBlockSize        = seg.currentBlockSize
+			leftSize             = dataSize             //*剩余要写入数据的大小
+			blockCount    uint32 = 0                    //*块的个数
+			currBlockSize        = seg.currentBlockSize //*当前已写入的大小
 		)
-
+		//*循环写入数据
 		for leftSize > 0 {
+			//*当前块可以写入的大小
 			chunkSize := blockSize - currBlockSize - chunkHeaderSize
 			if chunkSize > leftSize {
+				//*当前可以容纳剩余未写入的数据
 				chunkSize = leftSize
 			}
-
+			//*单次写入要写入到的位置
 			var end = dataSize - leftSize + chunkSize
 			if end > dataSize {
 				end = dataSize
 			}
 
-		
+			//*当前正在写入块的类型
 			var chunkType ChunkType
 			switch leftSize {
-			case dataSize: 
+			case dataSize:
 				chunkType = ChunkTypeFirst
 			case chunkSize:
 				chunkType = ChunkTypeLast
 			default:
 				chunkType = ChunkTypeMiddle
 			}
-			seg.appendChunkBuffer(chunkBuffer, data[dataSize-leftSize:end], chunkType)
 
+			seg.appendChunkBuffer(chunkBuffer, data[dataSize-leftSize:end], chunkType)
 			leftSize -= chunkSize
 			blockCount += 1
 			currBlockSize = (currBlockSize + chunkSize + chunkHeaderSize) % blockSize
@@ -225,14 +232,12 @@ func (seg *segment) writeToBuffer(data []byte, chunkBuffer *bytebufferpool.ByteB
 		position.ChunkSize = blockCount*chunkHeaderSize + dataSize
 	}
 
-
 	endBufferLen := chunkBuffer.Len()
 	if position.ChunkSize+padding != uint32(endBufferLen-startBufferLen) {
 		return nil, fmt.Errorf("wrong!!! the chunk size %d is not equal to the buffer len %d",
 			position.ChunkSize+padding, endBufferLen-startBufferLen)
 	}
 
-	
 	seg.currentBlockSize += position.ChunkSize
 	if seg.currentBlockSize >= blockSize {
 		seg.currentBlockNumber += seg.currentBlockSize / blockSize
@@ -337,19 +342,133 @@ func (seg *segment) writeChunkBuffer(buf *bytebufferpool.ByteBuffer) error {
 	return nil
 }
 
-//*返回下一个块
-// func (segReader *segmentReader)Next()([]byte,*ChunkPosition,error){
-// 	if segReader.segment.closed{
-// 		return nil,nil,ErrClosed
-// 	}
-// 	//*描述当前的快
-// 	chunkPosition :=&ChunkPosition{
-// 		SegmentId:   segReader.segment.id,
-// 		BlockNumber: segReader.blockNumber,
-// 		ChunkOffset: segReader.chunkOffset,
-// 	}
+func (seg *segment) Read(blockNumber uint32, chunkOffset int64) ([]byte, error) {
+	value, _, err := seg.readInternal(blockNumber, chunkOffset)
+	return value, err
+}
 
-// }
+// *要读取的块number和块内偏移
+func (seg *segment) readInternal(blockNumber uint32, chunkOffset int64) ([]byte, *ChunkPosition, error) {
+	if seg.closed {
+		return nil, nil, ErrClosed
+	}
+
+	var (
+		result    []byte       //*结果
+		block     []byte       //*临时块
+		segSize   = seg.Size() //*段文件的大小
+		nextChunk = &ChunkPosition{
+			SegmentId: seg.id,
+		}
+	)
+
+	if seg.isStartupTraversal {
+		block = seg.startupBlock.block
+	} else {
+		block = getBuffer()
+		if len(block) != blockSize {
+			block = make([]byte, blockSize)
+		}
+		defer putBuffer(block)
+	}
+	for {
+
+		size := int64(blockSize)                 //*块大小
+		offset := int64(blockNumber) * blockSize //*文件内的偏移量
+		//*如果要读取的位置+一个blocksize超过段文件的大小
+		//*|  blockNumber * blockSize + chunkOffset |  == seg.Size
+		if size+offset > segSize {
+			//*当前size == Chunkoffset
+			size = segSize - offset
+		}
+		//*即要读取的起始位置是段文件的结尾
+		if chunkOffset >= size {
+			return nil, nil, io.EOF
+		}
+
+		if seg.isStartupTraversal {
+
+			if seg.startupBlock.blockNumber != int64(blockNumber) || size != blockSize {
+
+				_, err := seg.fd.ReadAt(block[0:size], offset)
+				if err != nil {
+					return nil, nil, err
+				}
+
+				seg.startupBlock.blockNumber = int64(blockNumber)
+			}
+		} else {
+			if _, err := seg.fd.ReadAt(block[0:size], offset); err != nil {
+				return nil, nil, err
+			}
+		}
+
+		header := block[chunkOffset : chunkOffset+chunkHeaderSize]
+
+		length := binary.LittleEndian.Uint16(header[4:6])
+
+		start := chunkOffset + chunkHeaderSize
+		result = append(result, block[start:start+int64(length)]...)
+
+		checksumEnd := chunkOffset + chunkHeaderSize + int64(length)
+		checksum := crc32.ChecksumIEEE(block[chunkOffset+4 : checksumEnd])
+		savedSum := binary.LittleEndian.Uint32(header[:4])
+		if savedSum != checksum {
+			return nil, nil, ErrInvalidCRC
+		}
+
+		chunkType := header[6]
+
+		if chunkType == ChunkTypeFull || chunkType == ChunkTypeLast {
+			nextChunk.BlockNumber = blockNumber
+			nextChunk.ChunkOffset = checksumEnd
+
+			if checksumEnd+chunkHeaderSize >= blockSize {
+				nextChunk.BlockNumber += 1
+				nextChunk.ChunkOffset = 0
+			}
+			break
+		}
+		blockNumber += 1
+		chunkOffset = 0
+	}
+
+	return result, nextChunk, nil
+
+}
+
+// *返回下一个块
+func (segReader *segmentReader) Next() ([]byte, *ChunkPosition, error) {
+	// The segment file is closed
+	if segReader.segment.closed {
+		return nil, nil, ErrClosed
+	}
+
+	// this position describes the current chunk info
+	chunkPosition := &ChunkPosition{
+		SegmentId:   segReader.segment.id,
+		BlockNumber: segReader.blockNumber,
+		ChunkOffset: segReader.chunkOffset,
+	}
+
+	value, nextChunk, err := segReader.segment.readInternal(
+		segReader.blockNumber,
+		segReader.chunkOffset,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	chunkPosition.ChunkSize =
+		nextChunk.BlockNumber*blockSize + uint32(nextChunk.ChunkOffset) -
+			(segReader.blockNumber*blockSize + uint32(segReader.chunkOffset))
+
+	// update the position
+	segReader.blockNumber = nextChunk.BlockNumber
+	segReader.chunkOffset = nextChunk.ChunkOffset
+
+	return value, chunkPosition, nil
+}
 
 // *仅返回实际使用部分
 func (cp *ChunkPosition) Encode() []byte {
@@ -367,15 +486,10 @@ func (cp *ChunkPosition) encode(shrink bool) []byte {
 	buf := make([]byte, maxLen)
 
 	var index = 0
-
 	index += binary.PutUvarint(buf[index:], uint64(cp.SegmentId))
-
 	index += binary.PutUvarint(buf[index:], uint64(cp.BlockNumber))
-
 	index += binary.PutUvarint(buf[index:], uint64(cp.ChunkOffset))
-
 	index += binary.PutUvarint(buf[index:], uint64(cp.ChunkSize))
-
 	if shrink {
 		return buf[:index]
 	}

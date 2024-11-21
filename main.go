@@ -1,20 +1,37 @@
 package main
 
-import "fmt"
-
-const PORT = 8080
+import "github.com/rosedblabs/rosedb/v2"
 
 func main() {
-	i := 0
-	arr := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
-	brr :=arr[:0]
-	for{
-		if i == 10 {
-			break
-		}
-		fmt.Println("arr = %d",arr[i]);
-		i++;
+	// 指定选项
+	options := rosedb.DefaultOptions
+	options.DirPath = "/tmp/rosedb_basic"
+
+	// 打开数据库
+	db, err := rosedb.Open(options)
+	if err != nil {
+		panic(err)
 	}
-	fmt.Println("arr 的长度 : %d", len(arr))
-	fmt.Println("brr 的长度 : %d", len(brr))
+	defer func() {
+		_ = db.Close()
+	}()
+
+	// 设置键值对
+	err = db.Put([]byte("name"), []byte("rosedb"))
+	if err != nil {
+		panic(err)
+	}
+
+	// 获取键值对
+	val, err := db.Get([]byte("name"))
+	if err != nil {
+		panic(err)
+	}
+	println(string(val))
+
+	// 删除键值对
+	err = db.Delete([]byte("name"))
+	if err != nil {
+		panic(err)
+	}
 }
