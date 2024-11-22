@@ -285,7 +285,7 @@ func (seg *segment) writeAll(data [][]byte) (positions []*ChunkPosition, err err
 
 }
 
-func (seg *segment) write(data []byte) (pos *ChunkPosition, err error) {
+func (seg *segment) Write(data []byte) (pos *ChunkPosition, err error) {
 	if seg.closed {
 		return nil, ErrClosed
 	}
@@ -439,18 +439,18 @@ func (seg *segment) readInternal(blockNumber uint32, chunkOffset int64) ([]byte,
 
 // *返回下一个块
 func (segReader *segmentReader) Next() ([]byte, *ChunkPosition, error) {
-	// The segment file is closed
+	//*段文件已经关闭
 	if segReader.segment.closed {
 		return nil, nil, ErrClosed
 	}
 
-	// this position describes the current chunk info
+	//*描述当前段文件所在的位置
 	chunkPosition := &ChunkPosition{
 		SegmentId:   segReader.segment.id,
 		BlockNumber: segReader.blockNumber,
 		ChunkOffset: segReader.chunkOffset,
 	}
-
+	//*读取数据
 	value, nextChunk, err := segReader.segment.readInternal(
 		segReader.blockNumber,
 		segReader.chunkOffset,
@@ -463,7 +463,7 @@ func (segReader *segmentReader) Next() ([]byte, *ChunkPosition, error) {
 		nextChunk.BlockNumber*blockSize + uint32(nextChunk.ChunkOffset) -
 			(segReader.blockNumber*blockSize + uint32(segReader.chunkOffset))
 
-	// update the position
+	//*更新当前位置
 	segReader.blockNumber = nextChunk.BlockNumber
 	segReader.chunkOffset = nextChunk.ChunkOffset
 
